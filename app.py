@@ -1,9 +1,12 @@
 """Natural gas consumption by sector in Finland, Estonia, Latvia and Lithuania.
 
-Data: Eurostat complete energy balances nrg_bal_c (yearly).
+Data: Eurostat complete energy balances nrg_bal_c (yearly). Years that Eurostat
+has not published yet are filled with preliminary national energy balances
+where available: CSP Latvia (ENB060) and Statistics Lithuania (S1R099).
 Run with:  streamlit run app.py
 """
 import time
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -26,6 +29,17 @@ SECTORS = [
 ]
 OTHER = "Other"
 SECTOR_COLS = [s for _, s in SECTORS] + [OTHER]
+EUROSTAT = "Eurostat"
+TJ_PER_TWH = 3600.0
+
+# National sources (preliminary), used only for years Eurostat does not have yet.
+LV_URL = "https://data.stat.gov.lv/api/v1/en/OSP_PUB/START/NOZ/EN/ENB/ENB060"
+LV_SOURCE = "CSP Latvia ENB060 (preliminary)"
+LT_URL = ("https://osp-rs.stat.gov.lt/ords/ipospp/ospp/rest_xml/data/"
+          "S1R099_M8020305")
+LT_SOURCE = "Statistics Lithuania S1R099 (preliminary)"
+LT_GAS = "2000"  # fuel code: natural gas
+SDMX_G = "{http://www.sdmx.org/resources/sdmxml/schemas/v2_1/data/generic}"
 SECTOR_COLORS = {
     "Households": "#17becf",
     "Industry": "#7f7f7f",
@@ -93,7 +107,128 @@ def fetch_sector_balance():
     out["Total"] = wide["GIC"] / 1000
     out = out.reset_index().rename(columns={"time": "Year"})
     out["Country"] = out["geo"].map(GEO)
+    out["Source"] = EUROSTAT
     return out.drop(columns="geo")
+
+
+# ------------------------------------------------ national preliminary data
+def _get(url, **kwargs):
+    """HTTP request with retries. Raises RuntimeError if all attempts fail."""
+    err = "unknown error"
+    for attempt in range(3):
+        try:
+            r = requests.request(url=url, timeout=90, **kwargs)
+            if r.status_code == 200:
+                return r
+            err = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            err = type(e).__name__
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError(err)
+
+
+def _national_frame(country, source, years):
+    """years: {year: {"Households": TJ, ..., "Total": TJ}} -> rows in TWh."""
+    rows = []
+    for year, v in sorted(years.items()):
+        if not v.get("Total"):
+            continue  # no balance for this year
+        row = {s: v.get(s, 0.0) / TJ_PER_TWH for _, s in SECTORS}
+        row["Total"] = v["Total"] / TJ_PER_TWH
+        row[OTHER] = row["Total"] - sum(row[s] for _, s in SECTORS)
+        row.update(Year=str(year), Country=country, Source=source)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading CSP Latvia data...")
+def fetch_latvia(since):
+    """Natural gas balance from CSP Latvia ENB060 (TJ), years >= since."""
+    meta = _get(LV_URL, method="GET").json()
+    times = next(v["values"] for v in meta["variables"] if v["code"] == "TIME")
+    times = [t for t in times if int(t) >= since]
+    if not times:
+        return _national_frame("Latvia", LV_SOURCE, {})
+    query = {
+        "query": [
+            {"code": "ENERGY_RES", "selection": {"filter": "item", "values": ["NG"]}},
+            {"code": "ContentsCode", "selection": {"filter": "item", "values": ["ENB060"]}},
+            {"code": "INDICATOR", "selection": {"filter": "item", "values":
+                ["GEC", "T", "HH", "FC_IND_CON"]}},
+            {"code": "TIME", "selection": {"filter": "item", "values": times}},
+        ],
+        "response": {"format": "json-stat2"},
+    }
+    df = parse_jsonstat(_get(LV_URL, method="POST", json=query).json())
+    w = df.pivot_table(index="TIME", columns="INDICATOR", values="value", aggfunc="sum")
+    years = {}
+    for year, r in w.iterrows():
+        g = r.get
+        years[year] = {
+            "Households": g("HH", 0.0) or 0.0,
+            "Industry": g("FC_IND_CON", 0.0) or 0.0,  # incl. construction, as Eurostat
+            "Electricity & heat": -(g("T", 0.0) or 0.0),  # transformation input (< 0)
+            "Total": g("GEC", 0.0) or 0.0,
+        }
+    return _national_frame("Latvia", LV_SOURCE, years)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading Statistics Lithuania data...")
+def fetch_lithuania(since):
+    """Natural gas balance from Statistics Lithuania S1R099 (TJ), years >= since."""
+    r = _get(LT_URL, method="GET", params={"startPeriod": str(since)})
+    root = ET.fromstring(r.content)
+    # indicator -> sector; several indicators can add up to one sector
+    mapping = {
+        "nu": "Households",
+        "pramone": "Industry", "statyba": "Industry",
+        "neenergetika": "Non-energy use (feedstock)",
+        "pagrveiklelektrine": "Electricity & heat",
+        "pagrveiklkatiline": "Electricity & heat",
+        "pramimelektrinese": "Electricity & heat",
+        "pramimkatiline": "Electricity & heat",
+        "bendrsunaudojimas": "Total",
+    }
+    years = {}
+    for obs in root.iter(SDMX_G + "Obs"):
+        key = {v.get("id"): v.get("value")
+               for v in obs.find(SDMX_G + "ObsKey").iter(SDMX_G + "Value")}
+        if (key.get("kurasM8020305_1") != LT_GAS
+                or key.get("MATVNT") != "terdzauliai_tj"):
+            continue
+        sector = mapping.get(key.get("energetika_rodiklM802030"))
+        if sector is None:
+            continue
+        try:
+            value = float(obs.find(SDMX_G + "ObsValue").get("value"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if value != value:  # NaN
+            continue
+        y = years.setdefault(key["LAIKOTARPIS"], {})
+        y[sector] = y.get(sector, 0.0) + value
+    return _national_frame("Lithuania", LT_SOURCE, years)
+
+
+NATIONAL = {"Latvia": fetch_latvia, "Lithuania": fetch_lithuania}
+
+
+def add_national(sectors):
+    """Append national rows for years after each country's last Eurostat year."""
+    frames, failed = [sectors], []
+    for country, fetch in NATIONAL.items():
+        have = sectors.loc[sectors["Country"] == country, "Year"]
+        since = int(have.max()) + 1 if not have.empty else START_YEAR
+        try:
+            frames.append(fetch(since))
+        except Exception as e:
+            failed.append(f"{country}: {e}")
+    out = pd.concat([f for f in frames if not f.empty], ignore_index=True)
+    return out, failed
+
+
+def year_label(year, prelim_years):
+    return f"{year}*" if year in prelim_years else year
 
 
 def stacked_bars(df, unit, hover_fmt):
@@ -114,7 +249,8 @@ st.title("🏭 FinBalt Gas Consumption by Sector")
 st.markdown(
     "Yearly natural gas use in **Finland, Estonia, Latvia and Lithuania** split into "
     "households, industry, feedstock, electricity & heat and other uses "
-    "(Eurostat energy balances)."
+    "(Eurostat energy balances; the latest year from national statistics where "
+    "Eurostat has not published it yet)."
 )
 
 if st.sidebar.button("Clear cache & refresh 🔄"):
@@ -131,12 +267,36 @@ if sectors.empty:
     st.error("Eurostat returned no data.")
     st.stop()
 
+sectors, nat_failed = add_national(sectors)
+if nat_failed:
+    st.warning("Preliminary national data could not be loaded, so only Eurostat "
+               "years are shown for: " + "; ".join(nat_failed))
+prelim = sectors[sectors["Source"] != EUROSTAT]
+prelim_years = set(prelim["Year"])
+
 years = sorted(sectors["Year"].unique())
+
+
+def prelim_note(year):
+    """Caption naming the countries whose figures for this year are preliminary."""
+    rows = prelim[prelim["Year"] == year]
+    if rows.empty:
+        return
+    countries = ", ".join(rows["Country"])
+    missing = [c for c in COUNTRY_COLS
+               if c not in set(sectors.loc[sectors["Year"] == year, "Country"])]
+    text = (f"\\* {year}: preliminary national data for {countries} "
+            "(not yet in Eurostat; may be revised).")
+    if missing:
+        text += f" No data yet for {', '.join(missing)}."
+    st.caption(text)
+
 
 # --- One year, all countries
 st.subheader("Consumption by sector and country")
 c1, c2 = st.columns(2)
-sel_year = c1.selectbox("Year:", years, index=len(years) - 1)
+sel_year = c1.selectbox("Year:", years, index=len(years) - 1,
+                        format_func=lambda y: year_label(y, prelim_years))
 as_share = c2.radio("Show as:", ["TWh", "% of total"], horizontal=True) == "% of total"
 
 yr = (sectors[sectors["Year"] == sel_year].set_index("Country")
@@ -144,8 +304,10 @@ yr = (sectors[sectors["Year"] == sel_year].set_index("Country")
 unit = "%" if as_share else "TWh"
 plot_y = yr[SECTOR_COLS].div(yr["Total"], axis=0) * 100 if as_share else yr[SECTOR_COLS]
 fig = stacked_bars(plot_y, unit, ".1f")
-fig.update_yaxes(title_text=f"{sel_year} ({unit})", tickformat=".0f")
+fig.update_yaxes(title_text=f"{year_label(sel_year, prelim_years)} ({unit})",
+                 tickformat=".0f")
 st.plotly_chart(fig, use_container_width=True)
+prelim_note(sel_year)
 
 st.markdown("---")
 
@@ -153,21 +315,33 @@ st.markdown("---")
 st.subheader("Development over time")
 sel_country = st.selectbox("Country:", COUNTRY_COLS)
 hist = sectors[sectors["Country"] == sel_country].set_index("Year").sort_index()
+c_prelim = set(hist.index[hist["Source"] != EUROSTAT])
+hist.index = [year_label(y, c_prelim) for y in hist.index]
 fig_h = stacked_bars(hist[SECTOR_COLS], "TWh", ".2f")
 fig_h.update_traces(texttemplate=None)
 fig_h.update_yaxes(title_text=f"{sel_country} (TWh / year)", tickformat=".1f")
 st.plotly_chart(fig_h, use_container_width=True)
+if c_prelim:
+    src = hist["Source"].iloc[-1].replace(" (preliminary)", "")
+    st.caption(f"\\* Preliminary national data from {src}, not yet in Eurostat; "
+               "may be revised.")
 
 st.markdown("---")
 
 # --- Table
 st.subheader("Table (TWh)")
-table = sectors.set_index(["Country", "Year"])[SECTOR_COLS + ["Total"]]
-table = table.reindex(COUNTRY_COLS, level=0)
-st.dataframe(table.style.format("{:.2f}"), use_container_width=True)
+table = sectors.copy()
+table["Country"] = pd.Categorical(table["Country"], COUNTRY_COLS, ordered=True)
+table = table.sort_values(["Country", "Year"])
+table["Year"] = [year_label(y, set(prelim.loc[prelim["Country"] == c, "Year"]))
+                 for y, c in zip(table["Year"], table["Country"])]
+table["Country"] = table["Country"].astype(str)
+table = table.set_index(["Country", "Year"])[SECTOR_COLS + ["Total", "Source"]]
+num_cols = SECTOR_COLS + ["Total"]
+st.dataframe(table.style.format("{:.2f}", subset=num_cols), use_container_width=True)
 st.download_button(
     "Download CSV 📥",
-    table.round(3).to_csv().encode("utf-8"),
+    table.round({c: 3 for c in num_cols}).to_csv().encode("utf-8"),
     file_name="finbalt_gas_consumption_by_sector.csv",
     mime="text/csv",
 )
@@ -188,7 +362,26 @@ with st.expander("Method and caveats"):
   energy sector own use, other transformation, distribution losses and statistical
   differences.
 - Confidential or missing values count as 0, which moves them into *Other*.
-- Eurostat publishes the balances with about a one-year lag.
+- Eurostat publishes the balances with about a one-year lag (first release in
+  December of the following year).
+
+**Preliminary years (marked \\*):** where Eurostat does not yet have a year, it is
+taken from the national energy balance (TJ, converted to TWh) and replaced by
+Eurostat automatically once Eurostat publishes it.
+
+- **Latvia:** CSP `ENB060`, natural gas. Households = `HH`; Industry = `FC_IND_CON`
+  (industry and construction); Electricity & heat = transformation input (`T`);
+  Total = gross energy consumption (`GEC`). Non-energy use is not reported
+  separately (it is zero in Eurostat for Latvia).
+- **Lithuania:** Statistics Lithuania `S1R099_M8020305`, natural gas (`2000`).
+  Households = `nu`; Industry = `pramone` + `statyba`; Non-energy use =
+  `neenergetika`; Electricity & heat = public and autoproducer CHP and heat plants;
+  Total = gross consumption (`bendrsunaudojimas`).
+- **Finland and Estonia:** no preliminary national sector data before Eurostat.
+  Statistics Finland publishes its full energy balance in December and Statistics
+  Estonia in February, i.e. at the same time as Eurostat or later.
+- For 2024, where both exist, the national figures differ from Eurostat by about
+  1-2 % per sector.
 - Energy units are on a net calorific value basis, so totals are roughly 10 % lower
   than gross calorific value figures such as ENTSOG flows.
         """
