@@ -8,11 +8,12 @@ Data: Eurostat complete energy balances (`nrg_bal_c`), fetched live from the Eur
 Years that Eurostat has not published yet are filled with preliminary national energy
 balances and marked with `*`:
 
+- Estonia: Statistics Estonia `KE0240` (PxWeb API)
 - Latvia: CSP Latvia `ENB060` (PxWeb API)
 - Lithuania: Statistics Lithuania `S1R099_M8020305` (SDMX API)
 
-Finland and Estonia publish their national balances at the same time as Eurostat or
-later, so they have no preliminary source.
+Finland publishes its national balance at about the same time as Eurostat, so it has
+no preliminary source.
 
 ```
 pip install -r requirements.txt

@@ -2,7 +2,8 @@
 
 Data: Eurostat complete energy balances nrg_bal_c (yearly). Years that Eurostat
 has not published yet are filled with preliminary national energy balances
-where available: CSP Latvia (ENB060) and Statistics Lithuania (S1R099).
+where available: Statistics Estonia (KE0240), CSP Latvia (ENB060) and
+Statistics Lithuania (S1R099).
 Run with:  streamlit run app.py
 """
 import time
@@ -39,7 +40,9 @@ LT_URL = ("https://osp-rs.stat.gov.lt/ords/ipospp/ospp/rest_xml/data/"
           "S1R099_M8020305")
 LT_SOURCE = "Statistics Lithuania S1R099 (preliminary)"
 LT_GAS = "2000"  # fuel code: natural gas
-SDMX_G = "{http://www.sdmx.org/resources/sdmxml/schemas/v2_1/data/generic}"
+EE_URL = "https://andmed.stat.ee/api/v1/en/stat/KE0240"
+EE_SOURCE = "Statistics Estonia KE0240 (preliminary)"
+SDMX_G ="{http://www.sdmx.org/resources/sdmxml/schemas/v2_1/data/generic}"
 SECTOR_COLORS = {
     "Households": "#17becf",
     "Industry": "#7f7f7f",
@@ -210,7 +213,38 @@ def fetch_lithuania(since):
     return _national_frame("Lithuania", LT_SOURCE, years)
 
 
-NATIONAL = {"Latvia": fetch_latvia, "Lithuania": fetch_lithuania}
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading Statistics Estonia data...")
+def fetch_estonia(since):
+    """Natural gas balance from Statistics Estonia KE0240 (TJ, Eurostat codes)."""
+    meta = _get(EE_URL, method="GET").json()
+    var = {v["code"]: v for v in meta["variables"]}
+    year_code = next(c for c in var if c.lower().startswith("aasta"))
+    fuel_code = next(c for c in var if c.lower().startswith("kütuse"))
+    ind_code = next(c for c in var if c.lower().startswith("näitaja"))
+    times = [t for t in var[year_code]["values"] if int(t) >= since]
+    if not times:
+        return _national_frame("Estonia", EE_SOURCE, {})
+    codes = [c for c, _ in SECTORS] + ["GIC"]
+    query = {
+        "query": [
+            {"code": year_code, "selection": {"filter": "item", "values": times}},
+            {"code": fuel_code, "selection": {"filter": "item", "values": ["G3000"]}},
+            {"code": ind_code, "selection": {"filter": "item", "values": codes}},
+        ],
+        "response": {"format": "json-stat2"},
+    }
+    df = parse_jsonstat(_get(EE_URL, method="POST", json=query).json())
+    w = df.pivot_table(index=year_code, columns=ind_code, values="value", aggfunc="sum")
+    years = {}
+    for year, r in w.iterrows():
+        v = {s: float(r.get(c, 0.0) or 0.0) for c, s in SECTORS}
+        v["Total"] = float(r.get("GIC", 0.0) or 0.0)
+        years[year] = v
+    return _national_frame("Estonia", EE_SOURCE, years)
+
+
+NATIONAL = {"Estonia": fetch_estonia, "Latvia": fetch_latvia,
+            "Lithuania": fetch_lithuania}
 
 
 def add_national(sectors):
@@ -377,9 +411,11 @@ Eurostat automatically once Eurostat publishes it.
   Households = `nu`; Industry = `pramone` + `statyba`; Non-energy use =
   `neenergetika`; Electricity & heat = public and autoproducer CHP and heat plants;
   Total = gross consumption (`bendrsunaudojimas`).
-- **Finland and Estonia:** no preliminary national sector data before Eurostat.
-  Statistics Finland publishes its full energy balance in December and Statistics
-  Estonia in February, i.e. at the same time as Eurostat or later.
+- **Estonia:** Statistics Estonia `KE0240`, natural gas (`G3000`). The table
+  uses Eurostat codes, so the sectors map one to one; Total = `GIC`.
+- **Finland:** no preliminary national sector data before Eurostat. Statistics
+  Finland publishes its electricity and heat production and full energy balance
+  in late November and December, at about the same time as Eurostat.
 - For 2024, where both exist, the national figures differ from Eurostat by about
   1-2 % per sector.
 - Energy units are on a net calorific value basis, so totals are roughly 10 % lower
